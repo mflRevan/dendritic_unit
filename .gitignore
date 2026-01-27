@@ -1,1 +1,3 @@
 venv.bash
+__pycache__/
+.venv/
