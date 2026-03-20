@@ -1130,4 +1130,29 @@ Per-token (1.7501) performs WORSE than mean pool (1.6348) despite being 8.3x slo
 #### Finding 54: Max pooling is a reasonable runner-up
 Max pooling (1.6986) is 0.064 BPC behind mean pool but has identical speed. It captures extreme activations rather than the full distribution. The mean is a better summary for conditioning rotation angles.
 
+### Experiment 14: Controller Design Ablation (Phase 7)
+
+**Setup:** Char-level WikiText-2, comparing shared vs separate controllers and replace vs residual modes.
+
+| Rank | Model | BPC | Params | Overfit | Notes |
+|------|-------|-----|--------|---------|-------|
+| 1 | mode_replace | 1.6391 | 26.1M | +0.001 | QKVO, separate, replace |
+| 2 | mode_residual | 1.6411 | 26.4M | +0.000 | QKVO, separate, residual |
+| 3 | ctrl_separate | 1.6521 | 26.1M | +0.002 | QKVO, separate, replace (rerun) |
+| 4 | o_cond_separate | 1.7080 | 7.4M | +0.001 | O-only, separate, replace |
+| 5 | o_cond_residual | 1.7142 | 7.5M | +0.003 | O-only, separate, residual |
+| 6 | ctrl_shared | 1.7785 | 7.2M | +0.001 | QKVO, shared, replace |
+
+#### Finding 55: Replace and residual modes are statistically equivalent
+Replace (1.6391) vs residual (1.6411): only 0.002 BPC difference on QKVO. For O-only: separate (1.7080) vs residual (1.7142) = 0.006 BPC. The base weight in residual does not help — pure geometric generation (replace) is sufficient, and simpler.
+
+#### Finding 56: Separate controllers are essential for multi-projection
+Shared controller (1.7785) vs separate (1.6521): 0.126 BPC penalty. Despite 72% parameter reduction (7.2M vs 26.1M), sharing one geometric field across Q, K, V, O projections produces inferior, homogeneous weight matrices. Each projection needs its own geometric degrees of freedom.
+
+#### Finding 57: Shared controller loses to single-projection dedicated
+Shared QKVO (1.7785, 7.2M) performs WORSE than O-only dedicated (1.7080, 7.4M) despite modulating 4x more projections. A dedicated single-target field beats a shared multi-target field at similar parameter count. This confirms that independent geometric spaces per projection are crucial.
+
+#### Finding 58: Overfit-free property persists across all controller variants
+All 6 models show near-zero overfitting (0.000-0.003 BPC). This is robust to: mode (replace/residual), sharing (shared/separate), and target count (O-only/QKVO). The regularization benefit is inherent to the geometric parameterization itself.
+
 6. **VO conditioning is the robust practical choice** (F42): Best geo model on GPT-2, top-3 on char-level, lowest overfitting across all settings.
