@@ -89,6 +89,10 @@ def make_model(cfg, vocab_size):
             geo_use_pivot_offset=cfg.get("geo_use_pivot_offset", False),
             geo_cond_source=cfg.get("geo_cond_source", "mean_pool"),
             geo_shared_controller=cfg.get("geo_shared_controller", False),
+            geo_controller_type=cfg.get("geo_controller_type", "local"),
+            geo_rotation=cfg.get("geo_rotation", "quaternion"),
+            geo_coord_dim=cfg.get("geo_coord_dim", 3),
+            geo_rank=cfg.get("geo_rank", 0),
         )
     else:
         return Transformer(
@@ -385,6 +389,31 @@ PHASE7_CONTROLLER = OrderedDict([
     ("o_cond_residual",  {"arch": "geofield", "geo_target": "o", "geo_conditioning": "seq_conditioned", "geo_mode": "residual"}),
 ])
 
+# Phase 8: Cross-layer controller ablation (Tier 3)
+PHASE8_CONTROLLER_TYPE = OrderedDict([
+    ("ctrl_local",      {**_COND_BASE, "geo_controller_type": "local"}),
+    ("ctrl_first_only", {**_COND_BASE, "geo_controller_type": "first_only"}),
+    ("ctrl_ema",        {**_COND_BASE, "geo_controller_type": "ema"}),
+    ("ctrl_gru",        {**_COND_BASE, "geo_controller_type": "gru"}),
+])
+
+# Phase 9: Rotation type & coordinate dimension ablation (Tier 4)
+PHASE9_ROTATION = OrderedDict([
+    ("rot_quat_d3",     {**_COND_BASE, "geo_rotation": "quaternion", "geo_coord_dim": 3}),
+    ("rot_cayley_d3",   {**_COND_BASE, "geo_rotation": "cayley", "geo_coord_dim": 3}),
+    ("rot_cayley_d4",   {**_COND_BASE, "geo_rotation": "cayley", "geo_coord_dim": 4}),
+    ("rot_cayley_d6",   {**_COND_BASE, "geo_rotation": "cayley", "geo_coord_dim": 6}),
+    ("rot_linear_d3",   {**_COND_BASE, "geo_rotation": "linear", "geo_coord_dim": 3}),
+])
+
+# Phase 10: Decoder rank ablation (Tier 4)
+PHASE10_RANK = OrderedDict([
+    ("rank_full",   {**_COND_BASE, "geo_rank": 0}),
+    ("rank_4",      {**_COND_BASE, "geo_rank": 4}),
+    ("rank_8",      {**_COND_BASE, "geo_rank": 8}),
+    ("rank_16",     {**_COND_BASE, "geo_rank": 16}),
+])
+
 
 def load_results(path):
     if os.path.exists(path):
@@ -464,7 +493,7 @@ def main():
     phases = args.phase.split(",")
 
     # ---- Char-level phases ----
-    if any(p in phases for p in ["1", "2", "3", "5", "6", "7", "all"]):
+    if any(p in phases for p in ["1", "2", "3", "5", "6", "7", "8", "9", "10", "all"]):
         print("=" * 70)
         print("  Loading char-level WikiText-2...")
         print("=" * 70)
@@ -507,6 +536,24 @@ def main():
             run_phase("PHASE 7 (Char, Controller Design Ablation)",
                       PHASE7_CONTROLLER, char_data,
                       os.path.join(RESULTS_DIR, "phase7_controller.json"),
+                      seed=args.seed)
+
+        if "8" in phases:
+            run_phase("PHASE 8 (Char, Cross-Layer Controllers)",
+                      PHASE8_CONTROLLER_TYPE, char_data,
+                      os.path.join(RESULTS_DIR, "phase8_ctrl_type.json"),
+                      seed=args.seed)
+
+        if "9" in phases:
+            run_phase("PHASE 9 (Char, Rotation Type & Coord Dim)",
+                      PHASE9_ROTATION, char_data,
+                      os.path.join(RESULTS_DIR, "phase9_rotation.json"),
+                      seed=args.seed)
+
+        if "10" in phases:
+            run_phase("PHASE 10 (Char, Decoder Rank Ablation)",
+                      PHASE10_RANK, char_data,
+                      os.path.join(RESULTS_DIR, "phase10_rank.json"),
                       seed=args.seed)
 
     # ---- GPT-2 tokenizer phase ----

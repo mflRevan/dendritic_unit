@@ -101,6 +101,8 @@ class GeoFieldAttention(nn.Module):
         geo_lam_init: float = 0.1,
         geo_cond_source: str = "mean_pool",
         geo_shared_controller: bool = False,
+        geo_rotation: str = "quaternion",
+        geo_coord_dim: int = 3,
     ):
         super().__init__()
 
@@ -137,11 +139,12 @@ class GeoFieldAttention(nn.Module):
             gwf_conditioning = "token_conditioned"
 
         geo_kwargs = dict(
-            num_coords=geo_num_coords, coord_dim=3,
+            num_coords=geo_num_coords, coord_dim=geo_coord_dim,
             mode=geo_mode, conditioning=gwf_conditioning,
             use_scale=geo_use_scale, use_pivot_offset=geo_use_pivot_offset,
             rank=geo_rank, lam_init=geo_lam_init,
             num_heads=geo_num_heads, cond_dim=dim,
+            rotation_type=geo_rotation,
         )
 
         # Shared controller: one field generates all geo projections
@@ -193,9 +196,9 @@ class GeoFieldAttention(nn.Module):
             return None
         return _compute_context(x, self.geo_cond_source, self._attn_pool)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context=None) -> torch.Tensor:
         B, S, _ = x.shape
-        ctx = self._get_context(x)
+        ctx = context if context is not None else self._get_context(x)
 
         # Q, K, V projections
         q = self.q_field(x, ctx) if self.has_geo_q else self.q_proj(x)
@@ -251,6 +254,9 @@ class GeoFieldMLP(nn.Module):
         geo_use_pivot_offset: bool = False,
         geo_num_heads: int = 1,
         geo_lam_init: float = 0.1,
+        geo_rotation: str = "quaternion",
+        geo_coord_dim: int = 3,
+        **kwargs,  # absorb extra geo_kwargs (geo_cond_source, geo_shared_controller)
     ):
         super().__init__()
         self.geo_target = geo_target
@@ -259,22 +265,24 @@ class GeoFieldMLP(nn.Module):
         if geo_target == "mlp_up":
             self.geo_up = GeometricWeightField(
                 out_features=2 * hidden_dim, in_features=dim,
-                num_coords=geo_num_coords, coord_dim=3,
+                num_coords=geo_num_coords, coord_dim=geo_coord_dim,
                 mode=geo_mode, conditioning=geo_conditioning,
                 use_scale=geo_use_scale, use_pivot_offset=geo_use_pivot_offset,
                 rank=geo_rank, lam_init=geo_lam_init,
                 num_heads=geo_num_heads, cond_dim=dim,
+                rotation_type=geo_rotation,
             )
             self.w_down = nn.Linear(hidden_dim, dim, bias=False)
         elif geo_target == "mlp_down":
             self.w_fused = nn.Linear(dim, 2 * hidden_dim, bias=False)
             self.geo_down = GeometricWeightField(
                 out_features=dim, in_features=hidden_dim,
-                num_coords=geo_num_coords, coord_dim=3,
+                num_coords=geo_num_coords, coord_dim=geo_coord_dim,
                 mode=geo_mode, conditioning=geo_conditioning,
                 use_scale=geo_use_scale, use_pivot_offset=geo_use_pivot_offset,
                 rank=geo_rank, lam_init=geo_lam_init,
                 num_heads=geo_num_heads, cond_dim=dim,
+                rotation_type=geo_rotation,
             )
 
         self.dropout = nn.Dropout(dropout)
@@ -284,18 +292,18 @@ class GeoFieldMLP(nn.Module):
             return None
         return x.mean(dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        context = self._get_context(x)
+    def forward(self, x: torch.Tensor, context=None) -> torch.Tensor:
+        ctx = context if context is not None else self._get_context(x)
 
         if self.geo_target == "mlp_up":
-            fused = self.geo_up(x, context)
+            fused = self.geo_up(x, ctx)
             gate, data = fused.chunk(2, dim=-1)
             return self.w_down(self.dropout(F.silu(gate) * data))
         else:
             fused = self.w_fused(x)
             gate, data = fused.chunk(2, dim=-1)
             h = self.dropout(F.silu(gate) * data)
-            return self.geo_down(h, context)
+            return self.geo_down(h, ctx)
 
 
 # ---------- Block ----------
@@ -323,6 +331,8 @@ class GeoFieldBlock(nn.Module):
         geo_lam_init: float = 0.1,
         geo_cond_source: str = "mean_pool",
         geo_shared_controller: bool = False,
+        geo_rotation: str = "quaternion",
+        geo_coord_dim: int = 3,
     ):
         super().__init__()
         self.norm1 = RMSNorm(dim)
@@ -338,6 +348,8 @@ class GeoFieldBlock(nn.Module):
             geo_num_heads=geo_num_heads, geo_lam_init=geo_lam_init,
             geo_cond_source=geo_cond_source,
             geo_shared_controller=geo_shared_controller,
+            geo_rotation=geo_rotation,
+            geo_coord_dim=geo_coord_dim,
         )
 
         if _is_attn_target(geo_target):
@@ -356,11 +368,12 @@ class GeoFieldBlock(nn.Module):
             self.mlp = StandardMLP(dim, mlp_hidden_dim, dropout, use_swiglu=True)
             self.geo_residual = GeometricWeightField(
                 out_features=dim, in_features=dim,
-                num_coords=geo_num_coords, coord_dim=3,
+                num_coords=geo_num_coords, coord_dim=geo_coord_dim,
                 mode="replace", conditioning=geo_conditioning,
                 use_scale=geo_use_scale, use_pivot_offset=geo_use_pivot_offset,
                 rank=geo_rank, lam_init=geo_lam_init,
                 num_heads=geo_num_heads, cond_dim=dim,
+                rotation_type=geo_rotation,
             )
             self.geo_residual_lam = nn.Parameter(torch.tensor(geo_lam_init))
         else:
@@ -368,13 +381,21 @@ class GeoFieldBlock(nn.Module):
 
         self.geo_target = geo_target
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+    def forward(self, x: torch.Tensor, context=None) -> torch.Tensor:
+        if hasattr(self.attn, '_get_context'):
+            x = x + self.attn(self.norm1(x), context=context)
+        else:
+            x = x + self.attn(self.norm1(x))
+
+        if hasattr(self.mlp, '_get_context'):
+            x = x + self.mlp(self.norm2(x), context=context)
+        else:
+            x = x + self.mlp(self.norm2(x))
 
         if self.geo_target == "block_residual":
-            ctx = x.mean(dim=1) if hasattr(self, 'geo_residual') and \
-                self.geo_residual.conditioning != "static" else None
+            ctx = context if context is not None else (
+                x.mean(dim=1) if hasattr(self, 'geo_residual') and
+                self.geo_residual.conditioning != "static" else None)
             x = x + self.geo_residual_lam * self.geo_residual(x, ctx)
         return x
 
@@ -410,14 +431,30 @@ class GeoFieldTransformer(nn.Module):
         geo_lam_init: float = 0.1,
         geo_cond_source: str = "mean_pool",
         geo_shared_controller: bool = False,
+        geo_controller_type: str = "local",  # local, ema, gru, first_only
+        geo_rotation: str = "quaternion",
+        geo_coord_dim: int = 3,
     ):
         super().__init__()
         self.dim = dim
         self.seq_length = seq_length
         self.num_layers = num_layers
+        self.geo_controller_type = geo_controller_type
+        self.geo_conditioning = geo_conditioning
 
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.dropout_layer = nn.Dropout(dropout)
+
+        mlp_hidden_dim = int(dim * expand_factor)
+
+        # Cross-layer controller modules
+        if geo_controller_type == "gru" and geo_conditioning != "static":
+            state_dim = dim // 2
+            self.ctrl_gru = nn.GRUCell(dim, state_dim)
+            self.ctrl_proj = nn.Linear(state_dim, dim)
+            self._ctrl_state_dim = state_dim
+        elif geo_controller_type == "ema" and geo_conditioning != "static":
+            self.ctrl_alpha = nn.Parameter(torch.tensor(0.5))  # learned EMA decay
 
         mlp_hidden_dim = int(dim * expand_factor)
 
@@ -440,6 +477,8 @@ class GeoFieldTransformer(nn.Module):
                 geo_lam_init=geo_lam_init,
                 geo_cond_source=geo_cond_source,
                 geo_shared_controller=geo_shared_controller,
+                geo_rotation=geo_rotation,
+                geo_coord_dim=geo_coord_dim,
             )
             for _ in range(num_layers)
         ])
@@ -462,8 +501,34 @@ class GeoFieldTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dropout_layer(self.token_embed(x))
-        for block in self.blocks:
-            x = block(x)
+
+        if self.geo_controller_type == "local" or self.geo_conditioning == "static":
+            # Default: each block computes its own context
+            for block in self.blocks:
+                x = block(x)
+        elif self.geo_controller_type == "first_only":
+            # Compute context once from input embeddings, reuse across layers
+            ctx = x.mean(dim=1)
+            for block in self.blocks:
+                x = block(x, context=ctx)
+        elif self.geo_controller_type == "ema":
+            # Exponential moving average across layers
+            alpha = torch.sigmoid(self.ctrl_alpha)
+            h = torch.zeros_like(x.mean(dim=1))
+            for block in self.blocks:
+                summary = x.mean(dim=1)
+                h = alpha * h + (1 - alpha) * summary
+                x = block(x, context=h)
+        elif self.geo_controller_type == "gru":
+            # GRU state accumulation across layers
+            B = x.shape[0]
+            h = torch.zeros(B, self._ctrl_state_dim, device=x.device, dtype=x.dtype)
+            for block in self.blocks:
+                summary = x.mean(dim=1)
+                h = self.ctrl_gru(summary, h)
+                ctx = self.ctrl_proj(h)
+                x = block(x, context=ctx)
+
         x = self.norm(x)
         return self.head(x)
 

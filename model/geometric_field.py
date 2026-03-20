@@ -52,6 +52,63 @@ def _quat_rotate_points(q: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
     return pts + 2.0 * w * txv + 2.0 * _cross(t.expand_as(txv), txv)
 
 
+# ---------- Cayley rotation helpers (arbitrary dim, compile-friendly) ----------
+
+def _build_skew_symmetric(params: torch.Tensor, dim: int) -> torch.Tensor:
+    """Build skew-symmetric matrix from upper-triangular parameters.
+    params: (..., D*(D-1)/2) -> (..., D, D)"""
+    *batch_shape, _ = params.shape
+    idx = torch.triu_indices(dim, dim, offset=1, device=params.device)
+    A = params.new_zeros(*batch_shape, dim, dim)
+    A[..., idx[0], idx[1]] = params
+    return A - A.transpose(-1, -2)
+
+
+def _cayley_rotate_points(skew_params: torch.Tensor, angle: torch.Tensor,
+                          pts: torch.Tensor, dim: int) -> torch.Tensor:
+    """Rotate points via Cayley map: R = (I+A)^{-1}(I-A) where A is skew-symmetric.
+    skew_params: (H, D*(D-1)/2), angle: (H,)|(B,H)|(B,S,H), pts: (H, N, D)
+    Returns: rotated (..., H, N, D)"""
+    I = torch.eye(dim, device=pts.device, dtype=pts.dtype)
+    if angle.dim() == 1:
+        A = _build_skew_symmetric(skew_params, dim) * angle[:, None, None]
+        R = torch.linalg.solve(I + A, (I - A).expand_as(A))  # (H, D, D)
+        return torch.bmm(pts, R.transpose(-1, -2))
+    elif angle.dim() == 2:
+        B_sz = angle.shape[0]
+        sp = skew_params.unsqueeze(0).expand(B_sz, -1, -1)
+        A = _build_skew_symmetric(sp, dim) * angle[:, :, None, None]
+        R = torch.linalg.solve(I + A, (I - A).expand_as(A))
+        pts_exp = pts.unsqueeze(0).expand(B_sz, -1, -1, -1)
+        return torch.einsum('bhnd,bhde->bhne', pts_exp, R)
+    else:
+        B_sz, S, H = angle.shape
+        sp = skew_params.unsqueeze(0).unsqueeze(0).expand(B_sz, S, -1, -1)
+        A = _build_skew_symmetric(sp, dim) * angle[..., None, None]
+        R = torch.linalg.solve(I + A, (I - A).expand_as(A))
+        pts_exp = pts.unsqueeze(0).unsqueeze(0).expand(B_sz, S, -1, -1, -1)
+        return torch.einsum('bshnd,bshde->bshne', pts_exp, R)
+
+
+# ---------- Linear perturbation helpers ----------
+
+def _linear_perturb_points(direction: torch.Tensor, angle: torch.Tensor,
+                           pts: torch.Tensor) -> torch.Tensor:
+    """Additive perturbation: pts + angle * normalize(direction).
+    direction: (H, D), angle: (H,)|(B,H)|(B,S,H), pts: (H, N, D)
+    Returns: perturbed (..., H, N, D)"""
+    d = F.normalize(direction, dim=-1)
+    if angle.dim() == 1:
+        delta = (angle[:, None] * d).unsqueeze(1)             # (H, 1, D)
+        return pts + delta
+    elif angle.dim() == 2:
+        delta = (angle.unsqueeze(-1) * d.unsqueeze(0)).unsqueeze(2)  # (B, H, 1, D)
+        return pts.unsqueeze(0) + delta
+    else:
+        delta = (angle.unsqueeze(-1) * d.unsqueeze(0).unsqueeze(0)).unsqueeze(3)  # (B, S, H, 1, D)
+        return pts.unsqueeze(0).unsqueeze(0) + delta
+
+
 # ---------- Coordinate decoders ----------
 
 class LinearDecoder(nn.Module):
@@ -133,6 +190,7 @@ class GeometricWeightField(nn.Module):
         lam_init: float = 0.1,  # initial λ for residual / factorized
         num_heads: int = 1,     # >1 for per-head transforms
         cond_dim: int = 128,    # hidden dim of conditioning input
+        rotation_type: str = "quaternion",  # quaternion, cayley, linear
     ):
         super().__init__()
         self.out_features = out_features
@@ -142,6 +200,7 @@ class GeometricWeightField(nn.Module):
         self.mode = mode
         self.conditioning = conditioning
         self.num_heads = num_heads
+        self.rotation_type = rotation_type
 
         # ---- learnable latent coordinates ----
         # Shape: (num_heads, num_coords, coord_dim)  or (1, N, 3) if shared
@@ -149,8 +208,17 @@ class GeometricWeightField(nn.Module):
             torch.randn(num_heads, num_coords, coord_dim) * 0.1
         )
 
-        # ---- rotation axis (learned, per head) ----
-        self.axis = nn.Parameter(torch.randn(num_heads, coord_dim))
+        # ---- rotation parameters (type-dependent) ----
+        if rotation_type == "quaternion":
+            assert coord_dim == 3, "Quaternion rotation requires coord_dim=3"
+            self.axis = nn.Parameter(torch.randn(num_heads, coord_dim))
+        elif rotation_type == "cayley":
+            n_skew = coord_dim * (coord_dim - 1) // 2
+            self.skew_params = nn.Parameter(torch.randn(num_heads, n_skew) * 0.1)
+        elif rotation_type == "linear":
+            self.perturb_dir = nn.Parameter(torch.randn(num_heads, coord_dim))
+        else:
+            raise ValueError(f"Unknown rotation_type: {rotation_type}")
 
         # ---- angle ----
         if conditioning == "static":
@@ -203,61 +271,69 @@ class GeometricWeightField(nn.Module):
             assert context is not None
             return self.angle_proj(context)            # (B, H)
 
+    def _quaternion_rotate(self, centered: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+        """Quaternion rotation (3D only). centered: (H, N, 3), angle: various dims."""
+        if angle.dim() == 1:
+            q = _quat_from_axis_angle(self.axis, angle)
+            return _quat_rotate_points(q, centered)
+        elif angle.dim() == 2:
+            axis = self.axis.unsqueeze(0).expand(angle.shape[0], -1, -1)
+            q = _quat_from_axis_angle(axis, angle)
+            centered_exp = centered.unsqueeze(0).expand(angle.shape[0], -1, -1, -1)
+            return _quat_rotate_points(q, centered_exp)
+        else:
+            B, S, H = angle.shape
+            axis = self.axis.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+            q = _quat_from_axis_angle(axis, angle)
+            centered_exp = centered.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)
+            return _quat_rotate_points(q, centered_exp)
+
     def _transform_coords(self, angle: torch.Tensor) -> torch.Tensor:
         """Apply geometric transform to coordinates.
         angle: (H,) for static, (B, H) for seq_conditioned, (B, S, H) for token_conditioned
-        Returns: transformed coords, (..., H, N, 3)
+        Returns: transformed coords, (..., H, N, D)
         """
         # Pivot = centroid of coordinates + optional offset
-        pivot = self.coords.mean(dim=1, keepdim=True)  # (H, 1, 3)
+        pivot = self.coords.mean(dim=1, keepdim=True)  # (H, 1, D)
         if self.use_pivot_offset:
             pivot = pivot + self.pivot_offset.unsqueeze(1)
 
         # Center around pivot
-        centered = self.coords - pivot                  # (H, N, 3)
+        centered = self.coords - pivot                  # (H, N, D)
 
-        # Build quaternion
-        if angle.dim() == 1:
-            # static: angle (H,), axis (H, 3) -> q (H, 4)
-            q = _quat_from_axis_angle(self.axis, angle)    # (H, 4)
-            rotated = _quat_rotate_points(q, centered)     # (H, N, 3)
-        elif angle.dim() == 2:
-            # seq_conditioned: angle (B, H), axis (H, 3) -> q (B, H, 4)
-            axis = self.axis.unsqueeze(0).expand(angle.shape[0], -1, -1)  # (B, H, 3)
-            q = _quat_from_axis_angle(axis, angle)                         # (B, H, 4)
-            centered_exp = centered.unsqueeze(0).expand(angle.shape[0], -1, -1, -1)  # (B, H, N, 3)
-            rotated = _quat_rotate_points(q, centered_exp)                 # (B, H, N, 3)
+        # Apply rotation/perturbation based on type
+        if self.rotation_type == "quaternion":
+            rotated = self._quaternion_rotate(centered, angle)
+        elif self.rotation_type == "cayley":
+            rotated = _cayley_rotate_points(self.skew_params, angle, centered, self.coord_dim)
+        elif self.rotation_type == "linear":
+            rotated = _linear_perturb_points(self.perturb_dir, angle, centered)
         else:
-            # token_conditioned: angle (B, S, H), axis (H, 3)
-            B, S, H = angle.shape
-            axis = self.axis.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)   # (B, S, H, 3)
-            q = _quat_from_axis_angle(axis, angle)                             # (B, S, H, 4)
-            centered_exp = centered.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1, -1)  # (B, S, H, N, 3)
-            rotated = _quat_rotate_points(q, centered_exp)                     # (B, S, H, N, 3)
+            raise ValueError(f"Unknown rotation_type: {self.rotation_type}")
 
         # Optional scale
         if self.use_scale:
-            s = F.softplus(self.scale_logit)  # (H, 3)
+            s = F.softplus(self.scale_logit)  # (H, D)
             if rotated.dim() == 3:
-                rotated = rotated * s.unsqueeze(1)       # (H, N, 3)
+                rotated = rotated * s.unsqueeze(1)       # (H, N, D)
             elif rotated.dim() == 4:
-                rotated = rotated * s.unsqueeze(0).unsqueeze(2)  # (B, H, N, 3)
+                rotated = rotated * s.unsqueeze(0).unsqueeze(2)  # (B, H, N, D)
             else:
-                rotated = rotated * s.unsqueeze(0).unsqueeze(0).unsqueeze(3)  # (B, S, H, N, 3)
+                rotated = rotated * s.unsqueeze(0).unsqueeze(0).unsqueeze(3)  # (B, S, H, N, D)
 
         # Uncenter
         if rotated.dim() == 3:
-            return rotated + pivot                        # (H, N, 3)
+            return rotated + pivot                        # (H, N, D)
         elif rotated.dim() == 4:
-            return rotated + pivot.unsqueeze(0)           # (B, H, N, 3)
+            return rotated + pivot.unsqueeze(0)           # (B, H, N, D)
         else:
-            return rotated + pivot.unsqueeze(0).unsqueeze(0)  # (B, S, H, N, 3)
+            return rotated + pivot.unsqueeze(0).unsqueeze(0)  # (B, S, H, N, D)
 
     def _decode_weights(self, transformed: torch.Tensor) -> torch.Tensor:
         """Decode transformed coords to weight matrix.
-        transformed: (..., H, N, 3) -> (..., out, in)
+        transformed: (..., H, N, D) -> (..., out, in)
         """
-        # Flatten coords per head: (..., H, N*3)
+        # Flatten coords per head: (..., H, N*D)
         *batch_shape, H, N, D = transformed.shape
         flat = transformed.reshape(*batch_shape, H, N * D)
 

@@ -1155,4 +1155,27 @@ Shared QKVO (1.7785, 7.2M) performs WORSE than O-only dedicated (1.7080, 7.4M) d
 #### Finding 58: Overfit-free property persists across all controller variants
 All 6 models show near-zero overfitting (0.000-0.003 BPC). This is robust to: mode (replace/residual), sharing (shared/separate), and target count (O-only/QKVO). The regularization benefit is inherent to the geometric parameterization itself.
 
+### Experiment 15: Cross-Layer Controller Ablation (Phase 8)
+
+**Setup:** Char-level WikiText-2, QKVO conditioned, testing whether conditioning context should be computed locally per-layer or accumulated across layers via recurrent/EMA mechanisms.
+
+| Rank | Model | BPC | Params | Time/ep | Notes |
+|------|-------|-----|--------|---------|-------|
+| 1 | ctrl_local | 1.6186 | 26.11M | 12.0s | Per-layer independent mean-pool |
+| 2 | ctrl_ema | 1.6336 | 26.11M | 14.3s | Learned EMA decay across layers |
+| 3 | ctrl_gru | 1.6775 | 26.15M | 16.1s | GRU state accumulation across layers |
+| 4 | ctrl_first_only | 1.7342 | 26.11M | 14.2s | Context from input embeddings only |
+
+#### Finding 59: Per-layer local conditioning is optimal
+Local per-layer context (1.6186) beats EMA (1.6336, +0.015), GRU (1.6775, +0.059), and first-only (1.7342, +0.116). Cross-layer state accumulation adds complexity without benefit. Each layer benefits from conditioning on its **own** current representation, not a filtered version of earlier layers.
+
+#### Finding 60: EMA is the best cross-layer strategy, but still loses to local
+The EMA controller (learned α = sigmoid-parameterized blend) is only 0.015 BPC behind local, suggesting a smooth blend of current + past context has some merit. But the added parameter (α) and computation provide negative ROI vs the simpler local approach.
+
+#### Finding 61: GRU cross-layer controller adds cost without benefit
+GRU (1.6775) adds ~45K params and ~33% wall-clock time vs local, yet performs 0.059 BPC worse. The GRU's hidden state apparently smooths out the layer-specific information that conditioning needs. The recurrent bottleneck (dim/2 hidden) may also constrain the context capacity.
+
+#### Finding 62: Context freshness matters more than context history
+first_only (1.7342) is the worst variant, 0.116 BPC behind local. Using stale embeddings (before any transformer processing) produces severely degraded conditioning. Combined with F59-61, this establishes a clear ordering: **fresh per-layer input > accumulated state > global embedding**. The geometric field needs to see the current layer's representation to generate appropriate weights.
+
 6. **VO conditioning is the robust practical choice** (F42): Best geo model on GPT-2, top-3 on char-level, lowest overfitting across all settings.
