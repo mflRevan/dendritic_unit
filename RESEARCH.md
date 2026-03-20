@@ -1178,4 +1178,28 @@ GRU (1.6775) adds ~45K params and ~33% wall-clock time vs local, yet performs 0.
 #### Finding 62: Context freshness matters more than context history
 first_only (1.7342) is the worst variant, 0.116 BPC behind local. Using stale embeddings (before any transformer processing) produces severely degraded conditioning. Combined with F59-61, this establishes a clear ordering: **fresh per-layer input > accumulated state > global embedding**. The geometric field needs to see the current layer's representation to generate appropriate weights.
 
+### Experiment 16: Rotation Type & Coordinate Dimension Ablation (Phase 9)
+
+**Setup:** Char-level WikiText-2, QKVO conditioned, comparing quaternion vs Cayley (skew-symmetric) vs linear perturbation, and 3D vs 4D vs 6D coordinates.
+
+| Rank | Model | BPC | Params | Time/ep | Rotation | Coord Dim |
+|------|-------|-----|--------|---------|----------|-----------|
+| 1 | rot_cayley_d3 | 1.6401 | 26.1M | 16.3s | Cayley | 3 |
+| 2 | rot_quat_d3 | 1.6409 | 26.1M | 12.0s | Quaternion | 3 |
+| 3 | rot_cayley_d6 | 1.6522 | 51.3M | 18.4s | Cayley | 6 |
+| 4 | rot_cayley_d4 | 1.6542 | 34.5M | 17.2s | Cayley | 4 |
+| 5 | rot_linear_d3 | 1.6623 | 26.1M | 22.6s | Linear | 3 |
+
+#### Finding 63: Quaternion and Cayley rotations are equivalent at 3D
+Quaternion (1.6409) ≈ Cayley (1.6401): only 0.001 BPC difference. Both produce SO(3) rotations from the same degrees of freedom. The Cayley parameterization via `(I+A)^{-1}(I-A)` involves a matrix solve but achieves identical quality. Quaternion is preferred for 3D due to ~26% faster wall-clock time (no matrix solve).
+
+#### Finding 64: Higher coordinate dimensions hurt despite more parameters
+Cayley-4D (1.6542, 34.5M) and Cayley-6D (1.6522, 51.3M) both perform WORSE than Cayley-3D (1.6401, 26.1M) despite 32-97% more parameters. The decoder must map a larger flattened coordinate space (N×D) to the same weight shape, increasing the decoder's burden without adding useful geometric structure. 3D is the optimal coordinate dimension.
+
+#### Finding 65: SO(3) rotation is strictly better than linear perturbation
+Linear perturbation (1.6623) is 0.022 BPC worse than quaternion (1.6409) at identical parameter count. The nonlinear rotation structure — guaranteed orthogonality, norm preservation, smooth manifold — provides measurable benefit over a simple additive offset. The rotation inductive bias is not just cosmetic; it constrains the coordinate transformation to a geometrically meaningful subspace.
+
+#### Finding 66: The 3D coordinate space is a sweet spot
+Combining F63-65: 3D coordinates with SO(3) rotation (quaternion or Cayley) is optimal. Lower dimensionality forces efficient use of the coordinate manifold. Higher dimensions add redundant degrees of freedom that the model must learn to ignore. The 3D → weight matrix decoder acts as an information bottleneck that benefits from compact input.
+
 6. **VO conditioning is the robust practical choice** (F42): Best geo model on GPT-2, top-3 on char-level, lowest overfitting across all settings.
