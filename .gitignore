@@ -1,3 +1,6 @@
 venv.bash
 __pycache__/
 .venv/
+
+*.log
+*.json

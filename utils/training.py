@@ -5,29 +5,33 @@ Training Utilities
 
 def get_lr_for_iter(current_iter, total_iters, config):
     """
-    Calculate learning rate with multi-step schedule: 
-    warmup -> stable -> decay -> min -> final decay
+    Calculate learning rate with WSD schedule:
+    Warmup (linear) -> Stable (constant) -> Decay (linear)
     """
-    max_lr = config.get('LEARNING_RATE', 1e-3)
-    min_lr = config.get('MIN_LR', 1e-4)
-    warmup_pct = config.get('WARMUP_PERCENT', 0.005)
-    decay_start = config.get('DECAY_START_PERCENT', 0.70)
-    decay_end = config.get('DECAY_END_PERCENT', 0.80)
-    final_decay = config.get('FINAL_DECAY_PERCENT', 0.90)
+    max_lr = config.get('LEARNING_RATE', 3e-4)
+    min_lr = config.get('MIN_LR', 0.0)
     
-    # ... (Simplified implementation logic)
-    # Just a linear warmup cosine decay for simplicity in this utils file
-    # Or strict port of the robust one
+    # Percentages
+    warmup_pct = config.get('WARMUP_PERCENT', 0.1)
+    stable_pct = config.get('STABLE_PERCENT', 0.8)
+    # Decay percent is the remainder
     
     warmup_iters = int(total_iters * warmup_pct)
-    decay_iters = int(total_iters * (1.0 - warmup_pct)) # Simplified
+    decay_start_iter = int(total_iters * (warmup_pct + stable_pct))
     
+    # 1. Linear Warmup
     if current_iter < warmup_iters:
-        return min_lr + (max_lr - min_lr) * (current_iter / max(1, warmup_iters))
+        return (current_iter / max(1, warmup_iters)) * max_lr
+        
+    # 2. Stable Phase
+    elif current_iter < decay_start_iter:
+        return max_lr
+        
+    # 3. Linear Decay to Zero (or min_lr)
     else:
-        # Cosine decay
-        progress = (current_iter - warmup_iters) / max(1, total_iters - warmup_iters)
+        decay_steps = total_iters - decay_start_iter
+        progress = (current_iter - decay_start_iter) / max(1, decay_steps)
         progress = min(1.0, max(0.0, progress))
-        import math
-        coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr + (max_lr - min_lr) * coeff
+        # Linear decay: max_lr -> min_lr
+        return max_lr - (progress * (max_lr - min_lr))
+

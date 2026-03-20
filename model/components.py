@@ -1,12 +1,13 @@
 """
 Model Components
 ================
-Common building blocks for Transformer models.
+Common building blocks: RMSNorm, RoPE, SwiGLU MLP.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -16,8 +17,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
     
     def forward(self, x):
-        rms = torch.sqrt((x.pow(2).mean(dim=-1, keepdim=True)) + self.eps)
-        return (x / rms) * self.weight
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+
 
 class RoPE(nn.Module):
     """Rotary Position Embeddings (RoPE)."""
@@ -63,44 +64,10 @@ class RoPE(nn.Module):
         
         return (x * cos) + (self._neg_half(x) * sin)
 
-class MatryoshkaProj(nn.Module):
-    """Matryoshka Representation Learning projection for embeddings."""
-    def __init__(self, backbone_dim: int, model_dim: int, expansion_hidden: int = 128):
-        super().__init__()
-        self.backbone_dim = backbone_dim
-        self.model_dim = model_dim
-
-        if backbone_dim == model_dim:
-            self.mode = 'identity'
-            self.expand = None
-        elif backbone_dim > model_dim:
-            self.mode = 'truncate'
-            self.scale = nn.Parameter(torch.ones(model_dim))
-            self.bias = nn.Parameter(torch.zeros(model_dim))
-            self.expand = None
-        else:
-            self.mode = 'expand'
-            self.expand = nn.Sequential(
-                nn.Linear(backbone_dim, expansion_hidden, bias=False),
-                nn.SiLU(),
-                nn.Linear(expansion_hidden, model_dim, bias=False)
-            )
-            for m in self.expand.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.mode == 'identity':
-            return x
-        elif self.mode == 'truncate':
-            y = x[..., :self.model_dim]
-            return y * self.scale + self.bias
-        else:
-            return self.expand(x)
 
 class StandardMLP(nn.Module):
-    """Standard MLP / SwiGLU Block."""
-    def __init__(self, dim, hidden_dim, dropout, use_swiglu=True):
+    """Feed-forward block with optional SwiGLU activation."""
+    def __init__(self, dim, hidden_dim, dropout=0.0, use_swiglu=True):
         super().__init__()
         self.use_swiglu = use_swiglu
 

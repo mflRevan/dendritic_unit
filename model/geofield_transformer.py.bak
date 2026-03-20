@@ -1,0 +1,422 @@
+"""
+GeoField Transformer
+====================
+Transformer variant with Geometric Weight-Field Modulation at configurable
+insertion points.  The default (and primary) target is the attention output
+projection (W_O / attn.proj).
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .components import RMSNorm, StandardMLP
+from .attention import MultiHeadAttention
+from .geometric_field import GeometricWeightField
+
+
+class GeoFieldAttention(nn.Module):
+    """
+    Multi-Head Attention where specific projections can be replaced/modulated
+    by a GeometricWeightField.
+
+    Supported targets: "attn_out", "value", "both_vo"
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads=None,
+        dropout: float = 0.0,
+        max_seq_length: int = 16384,
+        # --- geo field config ---
+        geo_target: str = "attn_out",         # "attn_out" | "value" | "both_vo"
+        geo_mode: str = "residual",
+        geo_conditioning: str = "static",
+        geo_num_coords: int = 32,
+        geo_rank: int = 0,
+        geo_use_scale: bool = False,
+        geo_use_pivot_offset: bool = False,
+        geo_num_heads: int = 1,               # 1 = shared, >1 = per-head geo
+        geo_lam_init: float = 0.1,
+    ):
+        super().__init__()
+
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+
+        assert dim % num_heads == 0
+        assert num_heads % num_kv_heads == 0
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        self.num_queries_per_kv = num_heads // num_kv_heads
+        self.geo_target = geo_target
+        self.geo_conditioning = geo_conditioning
+
+        # ---------- projections ----------
+        q_size = num_heads * self.head_dim
+        kv_size = 2 * num_kv_heads * self.head_dim
+
+        # If target includes value, we need separate Q/K and V projections
+        if geo_target in ("value", "both_vo"):
+            self.qk_proj = nn.Linear(dim, q_size + num_kv_heads * self.head_dim, bias=False)
+            self.geo_v = GeometricWeightField(
+                out_features=num_kv_heads * self.head_dim,
+                in_features=dim,
+                num_coords=geo_num_coords,
+                coord_dim=3,
+                mode=geo_mode,
+                conditioning=geo_conditioning,
+                use_scale=geo_use_scale,
+                use_pivot_offset=geo_use_pivot_offset,
+                rank=geo_rank,
+                lam_init=geo_lam_init,
+                num_heads=geo_num_heads,
+                cond_dim=dim,
+            )
+        else:
+            self.qkv_proj = nn.Linear(dim, q_size + kv_size, bias=False)
+
+        # Output projection
+        if geo_target in ("attn_out", "both_vo"):
+            self.geo_out = GeometricWeightField(
+                out_features=dim,
+                in_features=dim,
+                num_coords=geo_num_coords,
+                coord_dim=3,
+                mode=geo_mode,
+                conditioning=geo_conditioning,
+                use_scale=geo_use_scale,
+                use_pivot_offset=geo_use_pivot_offset,
+                rank=geo_rank,
+                lam_init=geo_lam_init,
+                num_heads=geo_num_heads,
+                cond_dim=dim,
+            )
+        else:
+            self.proj = nn.Linear(dim, dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = dropout
+
+        from .components import RoPE
+        self.rope = RoPE(self.head_dim, max_seq_length=max_seq_length)
+
+    def _get_context(self, x: torch.Tensor):
+        """Derive conditioning context from input."""
+        if self.geo_conditioning == "static":
+            return None
+        # seq_conditioned: mean pool over sequence
+        return x.mean(dim=1)   # (B, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, _ = x.shape
+        context = self._get_context(x)
+
+        # ----- Q/K/V projections -----
+        if self.geo_target in ("value", "both_vo"):
+            qk = self.qk_proj(x)
+            q_size = self.num_heads * self.head_dim
+            k_size = self.num_kv_heads * self.head_dim
+            q = qk[..., :q_size]
+            k = qk[..., q_size:q_size + k_size]
+            v = self.geo_v(x, context)          # geo-modulated V
+        else:
+            qkv = self.qkv_proj(x)
+            q_size = self.num_heads * self.head_dim
+            k_size = self.num_kv_heads * self.head_dim
+            q = qkv[..., :q_size]
+            k = qkv[..., q_size:q_size + k_size]
+            v = qkv[..., q_size + k_size:]
+
+        # Reshape to multi-head
+        q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # RoPE
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # GQA: expand KV heads
+        if self.num_queries_per_kv > 1:
+            k = k.repeat_interleave(self.num_queries_per_kv, dim=1).contiguous()
+            v = v.repeat_interleave(self.num_queries_per_kv, dim=1).contiguous()
+
+        # Attention
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=True,
+        )
+
+        out = out.transpose(1, 2).reshape(B, S, self.dim)
+
+        # ----- Output projection -----
+        if self.geo_target in ("attn_out", "both_vo"):
+            out = self.geo_out(out, context)
+        else:
+            out = self.proj(out)
+
+        out = self.dropout(out)
+        return out
+
+
+class GeoFieldMLP(nn.Module):
+    """SwiGLU MLP where up or down projection is geo-modulated."""
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+        geo_target: str = "mlp_down",   # "mlp_up" | "mlp_down"
+        geo_mode: str = "residual",
+        geo_conditioning: str = "static",
+        geo_num_coords: int = 32,
+        geo_rank: int = 0,
+        geo_use_scale: bool = False,
+        geo_use_pivot_offset: bool = False,
+        geo_num_heads: int = 1,
+        geo_lam_init: float = 0.1,
+    ):
+        super().__init__()
+        self.geo_target = geo_target
+        self.geo_conditioning = geo_conditioning
+
+        if geo_target == "mlp_up":
+            self.geo_up = GeometricWeightField(
+                out_features=2 * hidden_dim,
+                in_features=dim,
+                num_coords=geo_num_coords, coord_dim=3,
+                mode=geo_mode, conditioning=geo_conditioning,
+                use_scale=geo_use_scale, use_pivot_offset=geo_use_pivot_offset,
+                rank=geo_rank, lam_init=geo_lam_init,
+                num_heads=geo_num_heads, cond_dim=dim,
+            )
+            self.w_down = nn.Linear(hidden_dim, dim, bias=False)
+        elif geo_target == "mlp_down":
+            self.w_fused = nn.Linear(dim, 2 * hidden_dim, bias=False)
+            self.geo_down = GeometricWeightField(
+                out_features=dim,
+                in_features=hidden_dim,
+                num_coords=geo_num_coords, coord_dim=3,
+                mode=geo_mode, conditioning=geo_conditioning,
+                use_scale=geo_use_scale, use_pivot_offset=geo_use_pivot_offset,
+                rank=geo_rank, lam_init=geo_lam_init,
+                num_heads=geo_num_heads, cond_dim=dim,
+            )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def _get_context(self, x: torch.Tensor):
+        if self.geo_conditioning == "static":
+            return None
+        return x.mean(dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        context = self._get_context(x)
+
+        if self.geo_target == "mlp_up":
+            fused = self.geo_up(x, context)
+            gate, data = fused.chunk(2, dim=-1)
+            return self.w_down(self.dropout(F.silu(gate) * data))
+        else:  # mlp_down
+            fused = self.w_fused(x)
+            gate, data = fused.chunk(2, dim=-1)
+            h = self.dropout(F.silu(gate) * data)
+            return self.geo_down(h, context)
+
+
+class GeoFieldBlock(nn.Module):
+    """Pre-norm Transformer block with geometric weight-field modulation."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_hidden_dim: int,
+        dropout: float = 0.0,
+        num_kv_heads=None,
+        max_seq_length: int = 16384,
+        # --- geo field config ---
+        geo_target: str = "attn_out",
+        geo_mode: str = "residual",
+        geo_conditioning: str = "static",
+        geo_num_coords: int = 32,
+        geo_rank: int = 0,
+        geo_use_scale: bool = False,
+        geo_use_pivot_offset: bool = False,
+        geo_num_heads: int = 1,
+        geo_lam_init: float = 0.1,
+    ):
+        super().__init__()
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+        # Determine what gets geo-modulated
+        attn_targets = {"attn_out", "value", "both_vo"}
+        mlp_targets = {"mlp_up", "mlp_down"}
+        block_target = {"block_residual"}
+
+        geo_kwargs = dict(
+            geo_mode=geo_mode, geo_conditioning=geo_conditioning,
+            geo_num_coords=geo_num_coords, geo_rank=geo_rank,
+            geo_use_scale=geo_use_scale, geo_use_pivot_offset=geo_use_pivot_offset,
+            geo_num_heads=geo_num_heads, geo_lam_init=geo_lam_init,
+        )
+
+        if geo_target in attn_targets:
+            self.attn = GeoFieldAttention(
+                dim, num_heads, num_kv_heads, dropout, max_seq_length,
+                geo_target=geo_target, **geo_kwargs,
+            )
+            self.mlp = StandardMLP(dim, mlp_hidden_dim, dropout, use_swiglu=True)
+        elif geo_target in mlp_targets:
+            self.attn = MultiHeadAttention(dim, num_heads, num_kv_heads, dropout, max_seq_length)
+            self.mlp = GeoFieldMLP(
+                dim, mlp_hidden_dim, dropout, geo_target=geo_target, **geo_kwargs,
+            )
+        elif geo_target in block_target:
+            # Standard attn+mlp, plus a geo residual branch
+            self.attn = MultiHeadAttention(dim, num_heads, num_kv_heads, dropout, max_seq_length)
+            self.mlp = StandardMLP(dim, mlp_hidden_dim, dropout, use_swiglu=True)
+            self.geo_residual = GeometricWeightField(
+                out_features=dim, in_features=dim,
+                num_coords=geo_num_coords, coord_dim=3,
+                mode="replace", conditioning=geo_conditioning,
+                use_scale=geo_use_scale, use_pivot_offset=geo_use_pivot_offset,
+                rank=geo_rank, lam_init=geo_lam_init,
+                num_heads=geo_num_heads, cond_dim=dim,
+            )
+            self.geo_residual_lam = nn.Parameter(torch.tensor(geo_lam_init))
+        else:
+            raise ValueError(f"Unknown geo_target: {geo_target}")
+
+        self.geo_target = geo_target
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+
+        if self.geo_target == "block_residual":
+            ctx = x.mean(dim=1) if hasattr(self, 'geo_residual') and \
+                self.geo_residual.conditioning != "static" else None
+            x = x + self.geo_residual_lam * self.geo_residual(x, ctx)
+        return x
+
+
+class GeoFieldTransformer(nn.Module):
+    """
+    Decoder-only Transformer with Geometric Weight-Field Modulation.
+
+    Drop-in replacement for Transformer, identical API for training.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        seq_length: int,
+        dim: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float = 0.0,
+        num_kv_heads=None,
+        expand_factor: int = 4,
+        use_swiglu: bool = True,
+        # --- geo config ---
+        geo_target: str = "attn_out",
+        geo_mode: str = "residual",
+        geo_conditioning: str = "static",
+        geo_num_coords: int = 32,
+        geo_rank: int = 0,
+        geo_use_scale: bool = False,
+        geo_use_pivot_offset: bool = False,
+        geo_num_heads: int = 1,
+        geo_lam_init: float = 0.1,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.seq_length = seq_length
+        self.num_layers = num_layers
+
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        self.dropout_layer = nn.Dropout(dropout)
+
+        mlp_hidden_dim = int(dim * expand_factor)
+
+        self.blocks = nn.ModuleList([
+            GeoFieldBlock(
+                dim=dim,
+                num_heads=num_heads,
+                mlp_hidden_dim=mlp_hidden_dim,
+                dropout=dropout,
+                num_kv_heads=num_kv_heads,
+                max_seq_length=seq_length,
+                geo_target=geo_target,
+                geo_mode=geo_mode,
+                geo_conditioning=geo_conditioning,
+                geo_num_coords=geo_num_coords,
+                geo_rank=geo_rank,
+                geo_use_scale=geo_use_scale,
+                geo_use_pivot_offset=geo_use_pivot_offset,
+                geo_num_heads=geo_num_heads,
+                geo_lam_init=geo_lam_init,
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.norm = RMSNorm(dim)
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+
+        # Weight tying
+        self.head.weight = self.token_embed.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout_layer(self.token_embed(x))
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        return self.head(x)
+
+    def get_geo_stats(self) -> dict:
+        """Collect diagnostic statistics from all geometric modules."""
+        stats = {}
+        for i, block in enumerate(self.blocks):
+            layer_stats = {}
+            # Collect from attention geo modules
+            if hasattr(block.attn, 'geo_out'):
+                for k, v in block.attn.geo_out.get_diagnostics().items():
+                    layer_stats[f"attn_out_{k}"] = v
+            if hasattr(block.attn, 'geo_v'):
+                for k, v in block.attn.geo_v.get_diagnostics().items():
+                    layer_stats[f"value_{k}"] = v
+            # Collect from MLP geo modules
+            if hasattr(block, 'mlp') and hasattr(block.mlp, 'geo_down'):
+                for k, v in block.mlp.geo_down.get_diagnostics().items():
+                    layer_stats[f"mlp_down_{k}"] = v
+            if hasattr(block, 'mlp') and hasattr(block.mlp, 'geo_up'):
+                for k, v in block.mlp.geo_up.get_diagnostics().items():
+                    layer_stats[f"mlp_up_{k}"] = v
+            # Block residual
+            if hasattr(block, 'geo_residual'):
+                for k, v in block.geo_residual.get_diagnostics().items():
+                    layer_stats[f"block_res_{k}"] = v
+                layer_stats["block_res_lam"] = block.geo_residual_lam.item()
+            if layer_stats:
+                stats[f"layer_{i}"] = layer_stats
+        return stats

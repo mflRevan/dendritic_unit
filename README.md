@@ -1,37 +1,50 @@
+# Spinformer
 
-# Dendritic Unit
-A library for investigating and implementing Dendritic Neural Networks.
+Research codebase for the Spinformer architecture — exploring quaternion-transformer hybrids.
 
-## Overview
-The **Dendritic Unit** is a drop-in replacement for the MLP blocks in Transfomers. It completely removes explicit activation functions (like ReLU, SiLU, GeLU) and replaces them with a **Competition & Coactivation** mechanism inspired by biological dendrites.
+## Structure
 
-### Core Mechanism
-1.  **Local Competition**: Input segments are matched against learned "templates" via dot product. The results undergo an **Absolute Softmax**, creating a winner-take-all competition where only the best-matching patterns activate.
-2.  **Global Coactivation**: The output intensity is modulated by the overall "agreement" of the input with the templates (mean absolute dot product), functioning like an NMDA receptor gain.
+```
+model/              # Core model components
+  components.py     # RMSNorm, RoPE, SwiGLU MLP
+  attention.py      # Multi-Head Attention (GQA + RoPE + Flash)
+  transformer.py    # Transformer (baseline decoder-only LM)
 
-### Variants
-*   **CNN-Gated**: Efficient implementation using Depthwise Conv1d to simulate dendritic branches.
-*   **Template-Gated (GLU)**: High-performance Triton kernel implementation where template matching gates a linear projection.
-*   **Template-FFN**: Pure dendritic projection. The templates *are* the weights. No parallel linear layer.
+ablation_suite/     # Algorithmic task benchmarks
+  config.py         # Task, Model, Training configs
+  train.py          # Training loop with AMP + cosine LR
+  evaluate.py       # ID + OOD length generalization eval
+  metrics.py        # MetricsTracker + plotting
+  main.py           # CLI runner for full ablation sweeps
+  quick_test.py     # Single experiment runner
+  tasks/            # Task implementations
+    base.py         # BaseTask ABC + dataset utilities
+    sorting.py      # Sequence sorting
+    reversal.py     # Sequence reversal
+    modular_arith.py# Modular sum (mod p)
+    bitwise_add.py  # Binary addition (carry propagation)
+    parity.py       # XOR parity + running XOR chain
 
-## Migration & Usage
-This repository contains the "clean" core implementation extracted from research code.
+utils/              # General utilities
+  data_utils.py     # Wikitext-2 data loading
+  training.py       # WSD learning rate schedule
+```
 
-*   `dendritic_unit.core`: Contains the layers and Triton kernels.
-*   `dendritic_unit.model`: Contains a full `DendriticTransformer` implementation.
+## Setup
 
-### Example
-```python
-from dendritic_unit.model.transformer import DendriticTransformer
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements.txt
+```
 
-model = DendriticTransformer(
-    vocab_size=32000,
-    seq_length=2048,
-    dim=1024,
-    num_heads=16,
-    num_layers=12,
-    use_dendritic=True,
-    use_template=True,       # Use Triton kernels
-    use_dendritic_ffn=True   # Use pure dendritic projection
-)
+## Quick Test
+
+```bash
+python -m ablation_suite.quick_test --task sorting --model baseline --epochs 5
+```
+
+## Full Ablation
+
+```bash
+python -m ablation_suite.main --all --epochs 10
 ```
