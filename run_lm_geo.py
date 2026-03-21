@@ -93,6 +93,7 @@ def make_model(cfg, vocab_size):
             geo_rotation=cfg.get("geo_rotation", "quaternion"),
             geo_coord_dim=cfg.get("geo_coord_dim", 3),
             geo_rank=cfg.get("geo_rank", 0),
+            geo_conditioned_layers=cfg.get("geo_conditioned_layers", "all"),
         )
     else:
         return Transformer(
@@ -414,6 +415,38 @@ PHASE10_RANK = OrderedDict([
     ("rank_16",     {**_COND_BASE, "geo_rank": 16}),
 ])
 
+# Phase 11: Layer-role study (which layers benefit from conditioning)
+# 4-layer model: test conditioning at different layer subsets
+PHASE11_LAYER_ROLE = OrderedDict([
+    ("layers_all",       {**_COND_BASE, "geo_conditioned_layers": "all"}),       # all conditioned (reference)
+    ("layers_lower",     {**_COND_BASE, "geo_conditioned_layers": "0,1"}),       # only lower layers
+    ("layers_upper",     {**_COND_BASE, "geo_conditioned_layers": "2,3"}),       # only upper layers
+    ("layers_first",     {**_COND_BASE, "geo_conditioned_layers": "0"}),         # only first layer
+    ("layers_last",      {**_COND_BASE, "geo_conditioned_layers": "3"}),         # only last layer
+    ("layers_middle",    {**_COND_BASE, "geo_conditioned_layers": "1,2"}),       # only middle layers
+    ("layers_alternating", {**_COND_BASE, "geo_conditioned_layers": "0,2"}),     # alternating (even)
+])
+
+# Phase 12: Cache-safe target study (which projections need conditioning)
+# Key question: can we keep K/V static (cacheable) while only conditioning Q/O?
+PHASE12_CACHE_SAFE = OrderedDict([
+    ("cache_qkvo_cond",  {**_COND_BASE}),                                                                        # all conditioned (reference)
+    ("cache_o_only",     {"arch": "geofield", "geo_target": "o", "geo_conditioning": "seq_conditioned"}),         # only O conditioned (full KV cache)
+    ("cache_qo_cond",    {"arch": "geofield", "geo_target": "qo", "geo_conditioning": "seq_conditioned"}),       # Q,O conditioned (K,V static → full KV cache)
+    ("cache_vo_cond",    {"arch": "geofield", "geo_target": "vo", "geo_conditioning": "seq_conditioned"}),        # V,O conditioned (K static)
+    ("cache_qvo_cond",   {"arch": "geofield", "geo_target": "qvo", "geo_conditioning": "seq_conditioned"}),      # Q,V,O conditioned (K static)
+])
+
+# Phase 13: Combined best configuration
+# Take winners from each ablation dimension and test combinations
+PHASE13_COMBINED = OrderedDict([
+    ("best_base",         {**_COND_BASE}),                                                                        # reference: qkvo, conditioned, mean_pool, local, quat_d3, full rank
+    ("best_cayley",       {**_COND_BASE, "geo_rotation": "cayley"}),                                              # swap in cayley (≈quat)
+    ("best_ema",          {**_COND_BASE, "geo_controller_type": "ema"}),                                          # swap in EMA controller
+    ("best_cayley_ema",   {**_COND_BASE, "geo_rotation": "cayley", "geo_controller_type": "ema"}),                # cayley + EMA
+    ("best_partial",      {**_COND_BASE, "geo_conditioned_layers": "0,1"}),                                       # only lower layers (test after Phase 11)
+])
+
 
 def load_results(path):
     if os.path.exists(path):
@@ -493,7 +526,7 @@ def main():
     phases = args.phase.split(",")
 
     # ---- Char-level phases ----
-    if any(p in phases for p in ["1", "2", "3", "5", "6", "7", "8", "9", "10", "all"]):
+    if any(p in phases for p in ["1", "2", "3", "5", "6", "7", "8", "9", "10", "11", "12", "13", "all"]):
         print("=" * 70)
         print("  Loading char-level WikiText-2...")
         print("=" * 70)
@@ -554,6 +587,24 @@ def main():
             run_phase("PHASE 10 (Char, Decoder Rank Ablation)",
                       PHASE10_RANK, char_data,
                       os.path.join(RESULTS_DIR, "phase10_rank.json"),
+                      seed=args.seed)
+
+        if "11" in phases:
+            run_phase("PHASE 11 (Char, Layer-Role Study)",
+                      PHASE11_LAYER_ROLE, char_data,
+                      os.path.join(RESULTS_DIR, "phase11_layer_role.json"),
+                      seed=args.seed)
+
+        if "12" in phases:
+            run_phase("PHASE 12 (Char, Cache-Safe Targets)",
+                      PHASE12_CACHE_SAFE, char_data,
+                      os.path.join(RESULTS_DIR, "phase12_cache_safe.json"),
+                      seed=args.seed)
+
+        if "13" in phases:
+            run_phase("PHASE 13 (Char, Combined Best)",
+                      PHASE13_COMBINED, char_data,
+                      os.path.join(RESULTS_DIR, "phase13_combined.json"),
                       seed=args.seed)
 
     # ---- GPT-2 tokenizer phase ----

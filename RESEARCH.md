@@ -1202,4 +1202,27 @@ Linear perturbation (1.6623) is 0.022 BPC worse than quaternion (1.6409) at iden
 #### Finding 66: The 3D coordinate space is a sweet spot
 Combining F63-65: 3D coordinates with SO(3) rotation (quaternion or Cayley) is optimal. Lower dimensionality forces efficient use of the coordinate manifold. Higher dimensions add redundant degrees of freedom that the model must learn to ignore. The 3D → weight matrix decoder acts as an information bottleneck that benefits from compact input.
 
+### Experiment 17: Decoder Rank Ablation (Phase 10)
+
+**Setup:** Char-level WikiText-2, QKVO conditioned (quaternion, 3D, local controller), comparing full-rank vs low-rank decoders. The decoder maps rotated/scaled coordinates (N_coords × coord_dim) to the weight matrix (out × in). Low-rank factorizes this as: coords → rank_r bottleneck → weight matrix.
+
+| Rank | Model | BPC | Params | Time | Decoder Rank | Train/Val Gap |
+|------|-------|-----|--------|------|-------------|---------------|
+| 1 | rank_full | 1.6551 | 26.1M | 360s | Full | +19.8% |
+| 2 | rank_16 | 1.8823 | 1.03M | 666s | 16 | +6.3% |
+| 3 | rank_8 | 1.9187 | 986K | 679s | 8 | +6.3% |
+| 4 | rank_4 | 1.9830 | 963K | 421s | 4 | +4.9% |
+
+#### Finding 67: Low-rank decoders severely underfit — full rank is essential
+The performance gap between full-rank (BPC 1.6551) and the best low-rank (rank_16, BPC 1.8823) is 0.2272 BPC — a massive degradation. Even rank_16 (1.03M params) loses 13.7% of the full-rank model's performance. The decoder is the critical bottleneck: it maps the geometric coordinate space to weight matrices, and compressing this mapping destroys the expressiveness that makes GeoField work.
+
+#### Finding 68: Low-rank models are parameter-efficient but capacity-starved
+All low-rank variants (963K–1.03M params) reduce the parameter count by ~96% vs full-rank (26.1M), but this extreme compression comes at severe cost. The low train/val gaps (4.9–6.3%) confirm these models aren't overfitting — they're **underfitting**. The low-rank decoder simply cannot represent enough weight diversity from the coordinate space.
+
+#### Finding 69: Rank scales sub-linearly with quality
+rank_4 → rank_8: +0.064 BPC improvement (2× rank). rank_8 → rank_16: +0.036 BPC improvement (2× rank). The marginal gain from doubling rank diminishes, suggesting even rank_32 or rank_64 would not close the 0.23 BPC gap to full-rank. The full-rank decoder's ability to map any coordinate configuration to any weight pattern is fundamentally different from the low-rank constraint.
+
+#### Finding 70: The decoder IS the model — not just a readout
+This experiment reveals that the geometric field's power resides predominantly in the decoder, not the rotation/coordinate structure. The coordinates and rotations provide a compact, conditionable parameterization, but the decoder's expressiveness determines what weight matrices can be generated. Low-rank decoders constrain the weight manifold to a thin subspace, losing the ability to express the diverse per-layer weight patterns needed for language modeling.
+
 6. **VO conditioning is the robust practical choice** (F42): Best geo model on GPT-2, top-3 on char-level, lowest overfitting across all settings.

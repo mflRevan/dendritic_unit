@@ -434,6 +434,7 @@ class GeoFieldTransformer(nn.Module):
         geo_controller_type: str = "local",  # local, ema, gru, first_only
         geo_rotation: str = "quaternion",
         geo_coord_dim: int = 3,
+        geo_conditioned_layers: str = "all",  # "all", or comma-separated indices e.g. "0,1"
     ):
         super().__init__()
         self.dim = dim
@@ -441,6 +442,12 @@ class GeoFieldTransformer(nn.Module):
         self.num_layers = num_layers
         self.geo_controller_type = geo_controller_type
         self.geo_conditioning = geo_conditioning
+
+        # Parse which layers get conditioning
+        if geo_conditioned_layers == "all":
+            self._cond_layer_set = set(range(num_layers))
+        else:
+            self._cond_layer_set = {int(x) for x in geo_conditioned_layers.split(",")}
 
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.dropout_layer = nn.Dropout(dropout)
@@ -468,7 +475,7 @@ class GeoFieldTransformer(nn.Module):
                 max_seq_length=seq_length,
                 geo_target=geo_target,
                 geo_mode=geo_mode,
-                geo_conditioning=geo_conditioning,
+                geo_conditioning=geo_conditioning if i in self._cond_layer_set else "static",
                 geo_num_coords=geo_num_coords,
                 geo_rank=geo_rank,
                 geo_use_scale=geo_use_scale,
@@ -480,7 +487,7 @@ class GeoFieldTransformer(nn.Module):
                 geo_rotation=geo_rotation,
                 geo_coord_dim=geo_coord_dim,
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
 
         self.norm = RMSNorm(dim)
